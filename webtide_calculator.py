@@ -76,7 +76,6 @@
 # /*
 #  * Tested against Pawlawicz's T_Tide and
 #  * Foreman's tide4_r2
-#  *
 # */
 #
 # /* Version 2.4 */
@@ -121,16 +120,20 @@
 # /* Version AGRG */
 # /*******************************************************************************
 #  * This script was translated into Python from the original webtidecor2.5.1.c
-#  * Modifications and additions made by Andrea Zagar - April, 2019
+#  * Modifications and additions made by Andrea Zagar @ COGS (NSCC) - April, 2019
 #  ******************************************************************************/
-
-
-#!/usr/bin/env python
+#  WEBTIDE HELP: http://www.bio.gc.ca/science/research-recherche/ocean/webtide/help-aider-en.php
 
 import math
 import sys
-import datetime as dt
+import os
+import argparse
+import csv
 import numpy as np
+from scipy.spatial import distance
+from AGRG_time import time_gps2datetime
+from read_nav_file import readSol
+from memory_profiler import profile
 
 #------------------------------------------------------------------------------------
 
@@ -178,12 +181,14 @@ class ShallowType(object):
 # Global constants:
 R = 6.3675e-8           # Radius of the earth
 nconst = 5              # Number of constituents
+version = 0             # Are the constituent files S2C or V2C? (S2C is 0, V2C is 1)
+solFreq = 200.00        # Default frequency for sol file data
+osPathChar = "/"        # Separator for file path depending on operating system (change to \ for windows)
 
 # Define the value for 2 * pi
 twopi = 2.0 * math.acos( -1.0 )
 
-# This defines the (Julian) date of the switch to the Gregorian calendar
-# (Used in the julday subroutine)
+# This defines the (Julian) date of the switch to the Gregorian calendar (Used in the julday subroutine)
 IGREG = (15 + 31 * (10 + 12 * 1582 ))
 
 # These define the indices for the 5 constituents used in this program
@@ -194,23 +199,29 @@ n2 = 2
 k1 = 3
 o1 = 4
 
+# Indices for constituent arrays
+ampIdx = 0
+phaseIdx = 1
+amp2Idx = 2
+phase2Idx = 3
+
 # Table of number of days for each month
 daytable = [
     [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31],
     [0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]]
 
 # Global variables:
-# global nodesArr, elemsArr
-nodesList, elemsList = [],[]
+global nodesArr, elemsArr, datumCoordArr, datumZArr
 numNodes, numElems = 0,0
 numSatAttr = 5
-#nodeMinTidesList = []
 
-# Dictionaries for reading iosfile (stores ALL possible constituents in those dictionaries)
-mainConstDict, shallConstDict = {}, {}
+# Dictionaries for reading iosfile (stores only constituents listed in config in those dictionaries)
+mainConstDict = {}      # -> key: main constituent name, value: main constituent factors
+shallConstDict = {}     # -> key: shallow constituent name, value: shallow constituent factors
 
 # Dictionary of main constituents used in calculations (around 5)
-constDict, constFilePathsDict = {}, {}
+constDict = {}          # -> key: constituent name, value: s2c or v2c data for constituent
+constFilePathsDict = {} # -> key: constituent name, value: filename of s2c or v2c data
 
 #------------------------------------------------------------------------------------
 #
@@ -229,6 +240,7 @@ constDict, constFilePathsDict = {}, {}
 # These formulae were taken from pp 98 and 107 of the Explanatory
 # Supplement to the Astronomical Ephermeris and the American
 # Ephermis and Nautical Almanac (1961)
+# @profile
 def astro_angles(d1):
 
     # Local variables to calculate
@@ -264,91 +276,168 @@ def astro_angles(d1):
     return h, pp, s, p, np, dh, dpp, ds, dp, dnp
 
 #------------------------------------------------------------------------------------
-# Gets satellite info from input line, puts the info into a new satellite structure and returns the structure
-def add_sat(satin):
-
-    return 'need to finish this'
-
-#------------------------------------------------------------------------------------
 # Finds the closest node to a point (ptx, pty) and the element containing
 # that point, if one exists.
 # Also gets the basis functions for interpolations to that point.
 # Returns the element number containing the point (ptx, pty).
 # Returns -999 if no element found containing the point (ptx, pty ).
+# @profile
 def basis2d(ptx, pty):
 
-    # Find node closest to point
-    closest = closestNode( numNodes, ptx, pty )
-    print("closest node: ", closest)
+    # Find 3 node IDs closest to point (node IDs are 1 greater than their indexes because node file starts at 1, not 0
+    closeNodes = closestNodesID(ptx, pty)
 
     # Try to find an element that contains the point and the closest node
     ele = -999
-    xCoords, yCoords, basis = [],[],[]
+    elemsList = []
+    outsideMeshFlag = 0
+    closestDist = 0
 
-    # Read in node vals for each element (subtract 1 because index of nodesDf starts at 0 and not 1)
-    for index in range(len(elemsList)):
-        row = elemsList[index]
-        n11, n22, n33 = row[0]-1, row[1]-1, row[2]-1
-        xCoords, yCoords = [],[]
-        # If one or more of the nodes is in this element
-        if (( closest == (n11) ) or ( closest == (n22) ) or ( closest == (n33) )):
-            #print(n11, n22, n33)
-            # Store lat and long of each node
-            xCoords.extend((nodesList[n11][0], nodesList[n22][0], nodesList[n33][0]))
-            yCoords.extend((nodesList[n11][1], nodesList[n22][1], nodesList[n33][1]))
-            # See if the point is within this element
-            flag, xCoords, yCoords = raybound(xCoords, yCoords, ptx, pty)
-            #print("flag: ", flag)
-            if flag == 1: # The point is within the element
-                print("n11: ",n11,", n22: ", n22,", n33: ", n33)
-                ele = index
-                basis = phi2d(xCoords, yCoords, ptx, pty)
-                #print("basis: ", basis)
-                break
-    # If the closest node's elements don't work, search through all elements
-    if (ele < 0):
-        print("searching through all elements")
-        for index in range(len(elemsList)):
-            row = elemsList[index]
-            n11, n22, n33 = row[0]-1, row[1]-1, row[2]-1
+    for closeNodeID in closeNodes:
+        # Read in node vals for each element (subtract 1 because index of nodesArr starts at 0 and not 1)
+        for index in range(elemsArr.shape[0]):
+            row = elemsArr[index]
+            id1, id2, id3 = row[0], row[1], row[2]
             xCoords, yCoords = [],[]
-            # Store lat and long of each node
-            xCoords.extend((nodesList[n11][0], nodesList[n22][0], nodesList[n33][0]))
-            yCoords.extend((nodesList[n11][1], nodesList[n22][1], nodesList[n33][1]))
-            # See if the point is within this element
-            flag, xCoords, yCoords = raybound(xCoords, yCoords, ptx, pty)
-            if flag == 1: # The point is within the element
-                print("n11: ",n11,", n22: ", n22,", n33: ", n33)
-                ele = index
-                basis = phi2d(xCoords, yCoords, ptx, pty)
-                return ele
+            # If one or more of the nodes is in this element
+            if (( closeNodeID == (id1) ) or ( closeNodeID == (id2) ) or ( closeNodeID == (id3) )):
+                # Check if element already added to list
+                if index not in [row[1] for row in elemsList]:
+                    elemsList.append([closeNodeID, index])
+                # Store lat and long of each node (need to subtract 1 from ID to get index in nodesArr)
+                xCoords.extend((nodesArr[id1-1][0], nodesArr[id2-1][0], nodesArr[id3-1][0]))
+                yCoords.extend((nodesArr[id1-1][1], nodesArr[id2-1][1], nodesArr[id3-1][1]))
+                # See if the point is within this element
+                flag = raybound(xCoords, yCoords, ptx, pty)
+                if flag == 1: # The point is within the element
+                    ele = index
+                    basis = phi2d(xCoords, yCoords, ptx, pty)
+                    return ele, basis, closestDist, ptx, pty, outsideMeshFlag
 
-    return ele, basis
+    # If the closest node's elements don't work, search through all elements
+    #print("searching through all elements")
+    # for index in range(elemsArr.shape[0]):
+    #     row = elemsArr[index]
+    #     n11, n22, n33 = row[0]-1, row[1]-1, row[2]-1
+    #     xCoordsFull, yCoordsFull = [],[]
+    #     # Store lat and long of each node
+    #     xCoordsFull.extend((nodesArr[n11][0], nodesArr[n22][0], nodesArr[n33][0]))
+    #     yCoordsFull.extend((nodesArr[n11][1], nodesArr[n22][1], nodesArr[n33][1]))
+    #     # See if the point is within this element
+    #     flag = raybound(xCoordsFull, yCoordsFull, ptx, pty)
+    #     if flag == 1: # The point is within the element
+    #         # print("found index in full set: ", index)
+    #         # print("n11: ",n11,", n22: ", n22,", n33: ", n33)
+    #         ele = index
+    #         # print("element-2: ", ele)
+    #         basis = phi2d(xCoordsFull, yCoordsFull, ptx, pty)
+    #         return closestNodeID, ele, basis, closestDist, ptx, pty, outsideMeshFlag
+
+    # If not inside closest node's elements, find closest element to point using those elements (elemsList)
+    closestDist = 9999
+    closestCentX, closestCentY = 0,0
+    point = np.array([[ptx,pty]])
+    # For each element containing the closest node
+    for closeNodeID, index in elemsList:
+        row = elemsArr[index]
+        # print("Nodes in element ", index, ": ", row, " and closest ID: ", closeNodeID)
+        xCoordsClose, yCoordsClose = [],[]
+        id1, id2, id3 = row[0], row[1], row[2]
+        # For each element, find centroid of triangle and then find distance from point to centroid
+        centX = (nodesArr[id1-1][0]+nodesArr[id2-1][0]+nodesArr[id3-1][0])/3
+        centY = (nodesArr[id1-1][1]+nodesArr[id2-1][1]+nodesArr[id3-1][1])/3
+        # Get Manhattan distance from point to centroid and compare
+        centroid = np.array([[centX,centY]])
+        dist = distance.cdist(point, centroid,'cityblock')
+        # print("Dist from point: ", point, " .. to centroid: ", centroid, "----> ", dist)
+        # If closest distance so far, update ele and basis
+        if dist < closestDist:
+            ele = index
+            closestDist = dist
+            outsideMeshFlag = 1
+            closestCentX, closestCentY = centX, centY
+            # Add node coordinates to list
+            xCoordsClose.extend((nodesArr[id1-1][0], nodesArr[id2-1][0], nodesArr[id3-1][0]))
+            yCoordsClose.extend((nodesArr[id1-1][1], nodesArr[id2-1][1], nodesArr[id3-1][1]))
+            basis = phi2d(xCoordsClose, yCoordsClose, ptx, pty)
+
+    # Closest dist, node is outside of mesh
+    closestDist = closestDist[0][0]
+
+    # This shouldn't ever happen, but a check in case
+    if ele < 0:
+        print("Error finding element! Some Markers not in the domain...\n")
+        sys.exit(2)
+
+    return ele, basis, closestDist, closestCentX, closestCentY, outsideMeshFlag
 
 #------------------------------------------------------------------------------------
-# Find the node that is closest to the point (ptx, pty).
-def closestNode(numnodes, ptx, pty):
+# Calculate the tidal correction for each node of the element and interpolate
+# to get the tidal correction at the new position.
+# @profile
+def calculateTide(ele, basis, day, month, year, hour, minute, seconds, latitude):
 
-    # Keep track of closest index
-    closeIdx = 0
-    closeDist = 0
+    # Variables
+    global version
+    elemRes, elemRes2, result = [],[],[]
 
-    # Go through node dataframe
-    for index in range(len(nodesList)):
-        row = nodesList[index]
-        if index == 0:
-            closeDist = math.fabs(pty - row[1]) + math.fabs(ptx - row[0])
-        else:
-            # Use Manhattan distance for calculation
-            currentDist = math.fabs(pty - row[1]) + math.fabs(ptx - row[0])
-            if currentDist < closeDist:
-                closeDist = currentDist
-                closeIdx = index
+    for i in range(3):
+        # Node numbers in nodesArr start at 1 (so need to correct because python arrays start at 0)
+        nodeIdx = elemsArr[ele][i] - 1
+        # Calculations
+        elemRes.append(TideP( day, month, year, hour, minute, seconds, latitude, nodeIdx, 0))
+        if (version > 0):
+            elemRes2.append(TideP( day, month, year, hour, minute, seconds, latitude, nodeIdx, 1))
 
-    return closeIdx
+    # Calculate results
+    result.append(elemRes[0] * basis[0] + elemRes[1] * basis[1] + elemRes[2] * basis[2])
+    if version > 0: # Two results returned for V2C file
+        result.append(elemRes2[0] * basis[0] + elemRes2[1] * basis[1] + elemRes2[2] * basis[2])
+
+    return result
+
+#------------------------------------------------------------------------------------
+# Find the indexes of the 3 nodes that are closest to the point (ptx, pty).
+# @profile
+def closestNodesID(ptx, pty):
+
+    # Add node IDs to this temporary array to make it easier to find smallest 3 distances
+    # arrSize = len(nodesArrCopy)
+    # nodeIds = np.arange(1,arrSize+1).reshape(arrSize, 1)
+    # tempNodesArr = np.append(nodeIds, nodesArrCopy, axis=1)
+
+    # Use Manhattan (cityblock) distance and find closest node to point, then return index of node
+    point = np.array([[ptx,pty]])
+    closeIdx1 = distance.cdist(point, nodesArr,'cityblock').argmin()
+    closeRow1 = np.copy(nodesArr[closeIdx1])
+    nodesArr[closeIdx1] = [999,999]
+    # Find second closest point
+    closeIdx2 = distance.cdist(point, nodesArr,'cityblock').argmin()
+    closeRow2 = np.copy(nodesArr[closeIdx2])
+    nodesArr[closeIdx2] = [999,999]
+    # Find third closest point
+    closeIdx3 = distance.cdist(point, nodesArr,'cityblock').argmin()
+
+    # Replace rows with original values
+    nodesArr[closeIdx1] = closeRow1
+    nodesArr[closeIdx2] = closeRow2
+
+    # Cdist.argmin returns index of closest node in nodesArr
+    # Need to return closest node ID, so have to add 1 to index (nodesArr is 0 indexed, and node IDs are 1 indexed)
+    return [closeIdx1+1, closeIdx2+1, closeIdx3+1]
+
+#------------------------------------------------------------------------------------
+# Find the z-value of the datum grid point closest to the point (ptx, pty).
+def getDatumTransform(ptx, pty):
+
+    # Find index of closest distance
+    point = np.array([[ptx,pty]])
+    closeIndex = distance.cdist(point, datumCoordArr,'cityblock').argmin()
+    return datumZArr[closeIndex]
 
 #------------------------------------------------------------------------------------
 # Get the day and month from the day # of the year
+# @profile
 def get_date(year, dayofyear):
 
     leap = (( year % 4 == 0 ) and ( year % 100 != 0 ) or ( year % 400 == 0 ))
@@ -364,6 +453,7 @@ def get_date(year, dayofyear):
 
 #------------------------------------------------------------------------------------
 # Calculate the Julian day number. Accounts for the change to the Gregorian calandar.
+# @profile
 def julday(id, im, iy):
 
     jy = iy
@@ -390,6 +480,7 @@ def julday(id, im, iy):
 
 #------------------------------------------------------------------------------------
 # Read in the constituent data from the IOS_tidetbl file
+# @profile
 def openvuf(iosfilePath):
 
     # Global vars
@@ -408,6 +499,8 @@ def openvuf(iosfilePath):
         lineLen = len(line)
         if lineLen <= 1:
             break
+        if line[0] not in constDict.keys():
+            continue
         # Check to make sure the phase isn't accidentally joined with a dood number in the file
         try:
             int(line[6])
@@ -461,17 +554,12 @@ def openvuf(iosfilePath):
 
                     # Make new sat object and add to sats
                     newSat = SatType(deld, float(phase), float(ratio), corrValue) # *** convert phase to float?
-                    #print("inserted new satellite into ", newMain.name)
                     newMain.sats.append(newSat)
-
-
 
                 satCount -= numLineSats
 
         # Save main constituent into dictionary
         mainConstDict[newMain.name] = newMain
-
-    print("number of main constituents: ", len(mainConstDict))
 
     # Get shallow constituents
     while (True):
@@ -481,6 +569,8 @@ def openvuf(iosfilePath):
         lineLen = len(line)
         if lineLen <= 1:
             break
+        if line[0] not in constDict.keys():
+            continue
         # Make new shallow constituent object
         numLineFactors = int(line[1])
         newShallow = ShallowType(line[0], numLineFactors)
@@ -494,13 +584,12 @@ def openvuf(iosfilePath):
         # Save shallow constituent into dictionary
         shallConstDict[newShallow.name] = newShallow
 
-
-    print("num shallow constituents: ", len(shallConstDict))
     # Close file
     iosfile.close()
 
 #------------------------------------------------------------------------------------
 #Calculates the basis functions for interpolating to a point inside an element.
+# @profile
 def phi2d(xloc, yloc, ptx, pty):
 
     # Declare variables
@@ -543,6 +632,7 @@ def phi2d(xloc, yloc, ptx, pty):
 #   the point and going off to infinity.
 # 	Count the number of polygon boundaries it crosses.
 # 	If an odd number, the point is inside the polygon, otherwise it is outside.
+# @profile
 def raybound(xpoly, ypoly, ptx, pty):
 
     bcross = 0  # Number of boundary crossings
@@ -606,63 +696,215 @@ def raybound(xpoly, ypoly, ptx, pty):
                     bcross += 1
 
     # Return the evenness/oddness of the boundary crossings i.e. the remainder from division by two.
-    return bcross % 2, xpoly, ypoly
+    return bcross % 2
+
+#------------------------------------------------------------------------------------
+# Loop through the SOL input file, for each point calculate the tidal correction
+# Write results to an output csv file
+# @profile
+def readInputSol(inputfilePath, outputfilePath, hertz):
+
+    # Read in sol file
+    rowsToSkip = int(solFreq/hertz)
+    solArr = readSol(inputfilePath)[0::rowsToSkip]
+
+    # Modify sol array before using
+    colsToKeep = ["lat", "lon", "alt",
+        "gps_week_number","time",
+        "standard_deviation_latitude", "standard_deviation_longitude", "standard_deviation_height",
+        "roll", "pitch", "heading",
+        "standard_deviation_roll", "standard_deviation_pitch", "standard_deviation_true_heading",
+        "nsspeed", "ewspeed", "vertspeed",
+        "standard_deviation_north_velocity", "standard_deviation_east_velocity", "standard_deviation_up_velocity"]
+    solArr['lon'] = np.rad2deg(solArr['lon'])
+    solArr['lat'] = np.rad2deg(solArr['lat'])
+    solArr = solArr[colsToKeep]
+
+    # Make new 2d list to hold new values (convert to numpy array at end, then join with original solArr)
+    # New values: result, result2, ellipsoidVal, flag, centroidX, centroidY, closestDistance
+    newValsArr = []
+
+    # Read in rows of input
+    for line in solArr:
+
+        # Variables needed for tidal calculation functions
+        longitude = float(line['lon'])
+        latitude = float(line['lat'])
+        datetime = time_gps2datetime(line['gps_week_number'].item(),line['time'].item())
+        year = datetime.date().year
+        month = datetime.date().month
+        day = datetime.date().day
+        hour = datetime.time().hour
+        minute = datetime.time().minute
+        seconds = datetime.time().second
+
+        # Get element containing the point, basis function, distance to centroid, centroid, flag (point outside of mesh = 1, inside = 0)
+        ele, basis, closestDist, centroidX, centroidY, flag = basis2d(longitude, latitude)
+
+        # If input point is inside an element in the mesh, then set centroid equal to that point
+        if not flag:
+            centroidX = longitude
+            centroidY = latitude
+
+        # Calculate results
+        results = calculateTide(ele, basis, day, month, year, hour, minute, seconds, latitude)
+
+        # Get datum transformation if necessary, then insert values into temporary new array
+        if version == 0:
+            # Get datum transformation based on centroid point, and difference between that and tide elevation
+            ellipsoidVal = getDatumTransform(centroidX, centroidY)
+            ellipsoidDiff = ellipsoidVal - results[0]
+            newValsArr.append((results[0], ellipsoidVal, ellipsoidDiff, flag, centroidX, centroidY, closestDist))
+        else:
+            newValsArr.append((results[0], results[1], flag, centroidX, centroidY, closestDist))
+
+    # Create numpy array based on 2d list
+    if version == 0:
+        newDtypes = [('tideElevMWL', 'float32'), ('WGS84Elev', 'float32'), ('MWL_WGS84_ElevDiff', 'float32'), ('flag', 'int8'), ('centroidLong', 'float32'), ('centroidLat', 'float32'), ('distToCentroid', 'float32')]
+    else:
+        newDtypes = [('tideCurrRes1', np.float32), ('tideCurrRes2', np.float32), ('flag', np.int8), ('centroidLong', np.float32), ('centroidLat', np.float32), ('distToCentroid', np.float32)]
+    newValsNp = np.array(newValsArr, dtype=newDtypes)
+
+    # Recreate solArr dtype list in order to join list with newDtypes
+    solDtypes = []
+    for colName in colsToKeep:
+        solDtypes.append((colName, solArr.dtype[colName].name))
+
+    # Extend original solArr to include new array of values
+    new_dt = np.dtype(solDtypes + newDtypes)
+    solArrFinal = np.empty(solArr.shape, dtype=new_dt)
+
+    # Populate final array
+    for name in colsToKeep:
+        solArrFinal[name] = solArr[name]
+
+    for name in [i[0] for i in newDtypes]:
+        solArrFinal[name] = newValsNp[name]
+
+    # Header and formatting
+    header = solArrFinal.dtype.names
+    header = ",".join(header)
+    # "lat", "lon", "alt", "gps_week_number","time", "standard_deviation_latitude", "standard_deviation_longitude",
+    # "standard_deviation_height", "roll", "pitch", "heading", "standard_deviation_roll", "standard_deviation_pitch",
+    # "standard_deviation_true_heading", "nsspeed", "ewspeed", "vertspeed", "standard_deviation_north_velocity",
+    # "standard_deviation_east_velocity", "standard_deviation_up_velocity",
+    if version == 0:
+        # "tideElevMWL", "WGS84Elev", "MWL_WGS84_ElevDiff", "flag", "centroidLong", "centroidLat", "distToCentroid"
+        format = "%1.8f, %1.8f, %1.8f, %d, %1.8f, %1.8f, %1.8f," \
+                 "%1.8f, %1.8f, %1.8f, %1.8f, %1.8f, %1.8f," \
+                 "%1.8f, %1.8f, %1.8f, %1.8f, %1.8f," \
+                 "%1.8f, %1.8f, " \
+                 "%1.6f, %1.6f, %1.6f, %d, %1.8f, %1.8f, %1.8f"
+    else:
+        # "tideCurrRes1", "tideCurrRes2", "flag", "centroidLong", "centroidLat", "distToCentroid"
+        format = "%1.8f, %1.8f, %1.8f, %d, %1.8f, %1.8f, %1.8f," \
+                 "%1.8f, %1.8f, %1.8f, %1.8f, %1.8f, %1.8f," \
+                 "%1.8f, %1.8f, %1.8f, %1.8f, %1.8f," \
+                 "%1.8f, %1.8f, " \
+                 "%1.6f, %1.6f, %d, %1.8f, %1.8f, %1.8f"
+    # # Save array to CSV file
+    np.savetxt(outputfilePath, solArrFinal, delimiter=",", header=header, fmt=format, comments='')
+
+#------------------------------------------------------------------------------------
+# Loop through the input file, for each point calculate the tidal correction
+# Write results to an output csv file
+# @profile
+def readInputText(inputfilePath, outputfilePath):
+
+    # Open input file
+    inputfile = open(inputfilePath,"r")
+
+    # Open output file for writing (csv)
+    outputfile = open(outputfilePath, 'w', newline='')
+    writer = csv.writer(outputfile, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
+
+    # Add headers to csv file
+    if version == 0:
+        writer.writerow(["tideElevMWL","WGS84Elev","MWL_WGS84_ElevDiff","longitude","latitude","year","month","day","hour","minute","second","flag","centroidLong","centroidLat","distToCentroid"])
+    else:
+        writer.writerow(["tideCurrent1","tideCurrent2","longitude","latitude","year","month","day","hour","minute","second","flag","centroidLong","centroidLat","distToCentroid"])
+
+    # Read in input values
+    for line in inputfile:
+
+        line = line.split()
+        longitude = float(line[0])
+        latitude = float(line[1])
+        year = int(line[2])
+        dayofyear = int(line[3])
+        month, day = get_date(year, dayofyear)
+        hour = int(line[4])
+        minute = int(line[5])
+        seconds = float(line[6])
+
+        # Get element number containing the point
+        ele, basis, closestDist, centroidX, centroidY, flag = basis2d(longitude, latitude)
+
+        if not flag:
+            centroidX = longitude
+            centroidY = latitude
+
+        # Calculate results
+        results = calculateTide(ele, basis, day, month, year, hour, minute, seconds, latitude)
+
+        # Get datum transformation if necessary, then output the tidal correction into file
+        if version == 0:
+            # Get datum transformation based on centroid point, and difference between that and tide elevation
+            ellipsoidVal = getDatumTransform(centroidX, centroidY)
+            ellipsoidDiff = ellipsoidVal - results[0]
+            str = '{0:.6f},{1:.6f},{2:.6f},{3:.8f},{4:.8f},{5},{6},{7},{8},{9},{10:.5f},{11},{12:.6f},{13:.8f},{14:.8f}'.format(results[0], ellipsoidVal, ellipsoidDiff, longitude, latitude, year, month, day, hour, minute, seconds, flag, centroidX, centroidY, closestDist)
+        else:
+            str = '{0:.6f},{1:.6f},{2:.8f},{3:.8f},{4},{5},{6},{7},{8},{9:.5f},{10},{11:.6f},{12:.8f},{13:.8f}'.format(results[0], results[1], longitude, latitude, year, month, day, hour, minute, seconds, flag, centroidX, centroidY, closestDist)
+        arr = str.split(",")
+        writer.writerow(arr)
+
+    # Close files
+    outputfile.close()
+    inputfile.close()
 
 #------------------------------------------------------------------------------------
 # Read in the mesh from a .nod/.ele set of files.
+# @profile
+def readDatum(datumFile):
+
+    # Reference (ID) starts at 0 in text file
+    global datumCoordArr, datumZArr
+
+    # Read datum file into numpy array (ONLY lat and long)
+    datumCoordArr = np.loadtxt(datumFile, dtype=float, usecols=[1,2,3],delimiter=",",skiprows=1)
+    datumZArr = np.copy(datumCoordArr[:,2])
+    # Remove Z column from coordinate array
+    datumCoordArr = datumCoordArr[:,[1,0]]
+
+    return
+
+#------------------------------------------------------------------------------------
+# Read in the mesh from a .nod/.ele set of files.
+# @profile
 def readNodes(nodeFile, elementFile):
 
     # These frames have to have indexes corresponding to element file indexes (starting at 1)
     global nodesArr, elemsArr, numNodes, numElems
-    global nodesList, elemsList
 
-    # Open the node file
-    nodefile = open(nodeFile, "r+")
-    # Loop through file
-    while (True):
-        # Get line from file
-        line = nodefile.readline().rstrip("/n").split()
-        # Check for blank line to signal end of file
-        if len(line) <= 1:
-            break
-        # Append long-lat pair to node list
-        nodesList.append([float(line[1]), float(line[2])]) #long, lat
-    nodefile.close()
+    # Read node file into numpy array
+    nodesArr = np.loadtxt(nodeFile, dtype=float, usecols=[1,2])
 
-    # Convert to numpy array
-    #nodesArr = np.asarray(nodesList)
-
-    # Open the element file
-    elementfile = open(elementFile, "r+")
-    # Loop through file
-    while (True):
-        # Get line from file
-        line = elementfile.readline().rstrip("/n").split()
-        # Check for blank line to signal end of main constituents
-        if len(line) <= 1:
-            break
-        # Append nodes to element list
-        elemsList.append([int(line[1]), int(line[2]), int(line[3])])
-
-    elementfile.close()
-
-    # Convert to numpy array
-    #elemsArr = np.asarray(elemsList)
+    # Read element into numpy array
+    elemsArr = np.loadtxt(elementFile, dtype=int, usecols=[1,2,3])
 
     # Number of nodes and elements
-    numNodes = len(nodesList)
-    numElems = len(elemsList)
+    numNodes = nodesArr.shape[0]
+    numElems = elemsArr.shape[0]
 
     return
 
 #------------------------------------------------------------------------------------
 # Calculate the amplitudes, phases, etc. for each of the constituents
+# @profile
 def setvuf(kh, xlat):
 
     # Global and local variables
     global mainConstDict, shallConstDict
-    dd = []
-    adj = 0
     kd = julday(31, 12, 1899) # this is a date
     d1 = (float)(kh - kd) - 0.5
     ktmp = kh * 24
@@ -748,6 +990,7 @@ def setvuf(kh, xlat):
 #        double *phase, char **innames, int numnames, mainptr *cons,
 #        shallptr *shall, int nmain, int nshall )
 # Calculates and returns the tidal correction
+# @profile
 def TideP(day, month, year, hour, minute, seconds, latitude, nodeIdx, isMultiResult):
 
     # First, get the julday
@@ -794,41 +1037,17 @@ def TideP(day, month, year, hour, minute, seconds, latitude, nodeIdx, isMultiRes
     return res
 
 #------------------------------------------------------------------------------------
-# int vuf( char *inname, mainptr *cons, shallptr *shall, int nmain, int nshall )
-# Finds constituent info corresponding to inname and returns the index to
-# the node containing the info. Shallow water constituent indices are
-# returned as their number greater than the max # of main constituents.
-# e.g. if we want the 2nd shallow water constituent and there are 45
-# main constituents, then the indice returned is 46, since constituents
-# are counted from zero. ( 45 - 1 + 2 = 46 )
-def vuf (inname):
-
-    return 'need to finish this'
-
 #------------------------------------------------------------------------------------
-#------------------------------------------------------------------------------------
-
-def main(cfgfilePath, inputfilePath, outputfilePath):
-# def main(argv):
+# @profile
+def main(cfgfilePath, inputfilePath, outputfilePath, datumFilePath, hertz=solFreq, baseHertz=solFreq):
 
     # Variables
     global constDict, constFilePathsDict
-    #constNames = []
-    #constFiles = []
-    #constFrames = []
-    cplx = -9
+    version = -9
 
-    if cfgfilePath == '' or inputfilePath == '' or outputfilePath == '':
+    if cfgfilePath == '' or inputfilePath == '' or outputfilePath == '' or datumFilePath == '':
         print('To start tide correction, enter the config, input and output files.')
         sys.exit(2)
-
-    # if len(argv) != 3:
-    #     print('To start tide correction, enter the config, input and output files.')
-    #     sys.exit(2)
-
-    # cfgfilePath = argv[0]
-    # inputfilePath = argv[1]
-    # outputfilePath = argv[2]
 
     # Open the config file
     cfgfile = open(cfgfilePath, "r+")
@@ -837,7 +1056,6 @@ def main(cfgfilePath, inputfilePath, outputfilePath):
     nodefile = cfgfile.readline().strip()
     elemfile = cfgfile.readline().strip()
     iosfile = cfgfile.readline().strip()
-    #print(nodefile, elemfile, iosfile)
 
     # Num constituents, constituent names and their tidal files
     numConst = int(cfgfile.readline().strip())
@@ -846,20 +1064,20 @@ def main(cfgfilePath, inputfilePath, outputfilePath):
         constName = cfgfile.readline().strip()
         filePath = cfgfile.readline().strip()
         constFilePathsDict[constName] = filePath
-        print(constName, filePath)
         # Set base extension for comparison
         if i == 0:
             base_ext = filePath.split('.')[2].upper()
         else:
             # Check to make sure all extensions are the same for all tidal files
-            ext = filePath.split('.')[2].upper()
+            path = filePath.split(osPathChar)[-1]
+            ext = path.split('.')[2].upper()
             if ext != base_ext:
                 print("Error. The extension (%s) for constituent data file (%s) is not the same as the first extension (%s).\nPlease check the filenames in the config file.", ext,filePath,base_ext)
                 sys.exit(2)
             elif ext == "S2C":
-                cplx = 0
+                version = 0
             elif ext == "V2C":
-                cplx = 1
+                version = 1
             # TODO: add functionality for V2R extensions
             # elif ext == "V2R":
             #     continue
@@ -874,10 +1092,11 @@ def main(cfgfilePath, inputfilePath, outputfilePath):
     # Read in the mesh (to numpy arrays)
     readNodes(nodefile, elemfile)
 
+    # Read in the datum transformation file
+    readDatum(datumFilePath)
+
     # TODO: Append min tide to node in nodeMinTidesList - but do we need min_tide at all?
     #for node in nodesList: nodeMinTidesList.append(0.0)
-    print("num nodes: ", numNodes)
-    print("num elements: ", numElems)
     #----------------------------------------------------------
     # Load the model tidal data for each constituent into arrays
     for const in constFilePathsDict.keys():
@@ -885,7 +1104,6 @@ def main(cfgfilePath, inputfilePath, outputfilePath):
         # Variables
         linesToSkip = 0
         infoHeader = ''
-        indivConstDict = {}
 
         # Extract header info first
         tmp_file = open(constFilePathsDict[const],"r")
@@ -898,129 +1116,45 @@ def main(cfgfilePath, inputfilePath, outputfilePath):
                 infoHeader += tmp_line.rstrip("\n")
             linesToSkip += 1
         #print('Header info: ', infoHeader)
-
-        # This current line will be used in next stage
-        tmp_line = tmp_line.rstrip("\n").split()
-
-        # Make arrays for indivConstDict
-        # TODO: add functionality for V2R extensions
-        indivConstDict['amp'] = []
-        indivConstDict['phase'] = []
-        #indivConstDict['min_tide'] = []
-        if cplx == 1: # V2C has extra columns
-            indivConstDict['amp2'] = []
-            indivConstDict['phase2'] = []
-            #indivConstDict['min_tide2'] = []
-
-        # Populate arrays with rest of data
-        while(True):
-            indivConstDict['amp'].append(float(tmp_line[1]))
-            indivConstDict['phase'].append(float(tmp_line[2]))
-            #indivConstDict['min_tide'].append(0.0)
-            # Check if V2C file
-            if cplx == 1:
-                indivConstDict['amp2'].append(float(tmp_line[3]))
-                indivConstDict['phase2'].append(float(tmp_line[4]))
-                #indivConstDict['min_tide2'].append(0.0)
-            # Get new line
-            tmp_line = tmp_file.readline().rstrip("\n").split()
-            if len(tmp_line) == 0:
-                print("Done! length of arrays: ", len(indivConstDict['amp']))
-                break
-
         tmp_file.close()
 
-        # Populate and save new data frame ** ADD FOR V2R
-        # TODO: Add for V2R
-        constDict[const] = indivConstDict
+        # TODO: add functionality for V2R extensions
+        # TODO: add functionality to save min_tides in numpy arrays (right now values are all initialized to 0.0)
+        # min_tide and min_tide2 (for V2C)
+
+        # Read rest of file into numpy array
+        # If V2C, has 2 more cols
+        if version == 1:
+            dts = [('id',int),('amp',float),('phase',float),('amp2',float),('phase2',float)]
+        else:
+            dts = [('id',int),('amp',float),('phase',float)]
+
+        constArr = np.loadtxt(constFilePathsDict[const], dtype=dts, skiprows=linesToSkip)
+
+        # Populate and save new array in dictionary of constituent data
+        constDict[const] = constArr
 
     #----------------------------------------------------------
-    # Min tides? doesn't seem to do anything in webtidecor
+    # TODO: Min tides? doesn't seem to do anything in webtidecor
     #----------------------------------------------------------
-
-    # Set initial values
-    day = 0
-    month = 0
-    year = 0
-    hour = 0
-    minute = 0
-    seconds = 0.0
-    longitude = 0.0
-    latitude = 0.0
-    reslt = 0.0
-    reslt2 = 0.0
 
     # Read in the constituent data from iosfile
-    # TODO: change to arrays, not dataframes
     openvuf(iosfile)
 
-    # Loop through the input file, for each line calculate the tidal correction
-    # Fields: long, lat, year, dayofyear, hour, minute, seconds
-    # Open the input/output files
+    #----------------------------------------------------------
+    # Read input file
+    #----------------------------------------------------------
 
-    # open input and output files
-    inputfile = open(inputfilePath,"r")
-    outputfile = open(outputfilePath,"w")
+    # Figure out the input type based on file extension (.sol or .txt)
+    fileExt = inputfilePath.split(".")[-1]
 
-    # Read in input values
-    for line in inputfile:
-        line = line.split()
-        longitude = float(line[0])
-        latitude = float(line[1])
-        year = int(line[2])
-        dayofyear = int(line[3])
-        month, day = get_date(year, dayofyear)
-        hour = int(line[4])
-        minute = int(line[5])
-        seconds = float(line[6])
-
-        print(longitude, latitude, year, month, day, hour, minute, seconds)
-
-        # Get element number containing the point
-        ele, basis = basis2d( longitude, latitude )
-        print("element: ", ele)
-        print("basis: ", basis)
-
-        if ele < 0:
-            print("Error finding element! Some Markers not in the domain...\n")
-            sys.exit(2)
-
-        # If the point is inside and element, calculate the tidal correction for
-        # each node of the element and interpolate to get the tidal correction
-        # at the new position.
-        elemRes, elemRes2 = [],[]
-        # elemMin, elemMin2 = [],[]
-        for i in range(3):
-            nodeIdx = elemsList[ele][i] - 1
-            # node numbers in nodesDf start at 1 (correct because arrays start at 0)
-            #print("elem node#", i, " : ", node)
-            elemRes.append(TideP( day, month, year, hour, minute, seconds, latitude, nodeIdx, 0))
-            if (cplx > 0):
-                elemRes2.append(TideP( day, month, year, hour, minute, seconds, latitude, nodeIdx, 1))
-            #min_tide = constDict[constName]['amp'][nodeIdx]
-            #elemMin.append(constDict)
-
-        # Calculate results
-        reslt = elemRes[0] * basis[0] + elemRes[1] * basis[1] + elemRes[2] * basis[2]
-        print("result: ", reslt)
-        # + elem_min[0] * basis[0] + elem_min[1] * basis[1] + elem_min[2] * basis[2]
-        if cplx > 0:
-            reslt2 = elemRes2[0] * basis[0] + elemRes2[1] * basis[1] + elemRes2[2] * basis[2]
-            print("result2: ", reslt2)
-            # + elem_min2[0] * basis[0] + elem_min2[1] * basis[1] + elem_min2[2] * basis[2]
-
-        # Output the tidal correction into file
-        if cplx == 0:
-            str = '{0:.4f} {1:.8f} {2:.8f} {3} {4} {5} {6} {7:.2f}\n'.format(reslt, longitude, latitude, year, dayofyear, hour, minute, seconds)
-            outputfile.write(str)
-            print("res: ", str)
-        else:
-            str = '{0:.4f} {1:.4f} {2:.8f} {3:.8f} {4} {5} {6} {7} {8:.2f}\n'.format(reslt, reslt2, longitude, latitude, year, dayofyear, hour, minute, seconds)
-            outputfile.write(str)
-            print("res2: ", str)
-
-    outputfile.close()
-    inputfile.close()
+    if fileExt == 'sol': # Read sol file
+        readInputSol(inputfilePath, outputfilePath, hertz)
+    elif fileExt == 'txt': # Regular webtide input file
+        readInputText(inputfilePath, outputfilePath)
+    else:
+        print("Invalid input file type. Exiting")
+        sys.exit()
 
     # FIN!
 
@@ -1028,11 +1162,40 @@ def main(cfgfilePath, inputfilePath, outputfilePath):
 #------------------------------------------------------------------------------------
 
 ###########################################################################
-# This will be run if the library is used "stand alone" on the command line
+# This will be run if the script is used on the command line
 ###########################################################################
-# if __name__ == "__main__":
-#
-#     main(sys.argv[1:])
 
+if __name__=='__main__':
+    #Get the input arguments
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--config','-c',help ='Input webtide configuration (.cfg) file to read',metavar="<file>",required=True)
+    parser.add_argument('--input','-i',help ='Input navigation (sol/txt) file to read',metavar="<file>",required=True)
+    parser.add_argument('--output','-o',help ='Output CSV file to write',default="results.csv",metavar="<csvfile>")
+    parser.add_argument('--datum','-d',help ='Input datum conversion (txt) file to read',metavar="<file>",required=True)
+    parser.add_argument('--hertz','-hz',help ='Value in hertz to sample sol file',default=solFreq,metavar="<float>")
+    parser.add_argument('--hertzdef','-hzdef',help ='Default value in hertz of sol file data',default=solFreq,metavar="<float>")
 
+    commandline=parser.parse_args()
 
+    # Check if the config file exists - exit if not
+    if not os.path.exists(commandline.config):
+        print("%s the config file cannot be found - are you sure it exists?"%commandline.config)
+        sys.exit(1)
+
+    # Check if the input navigation file exists - exit if not
+    if not os.path.exists(commandline.input):
+        print("%s the input file cannot be found - are you sure it exists?"%commandline.input)
+        sys.exit(1)
+
+    # Check if the datum conversion file exists - exit if not
+    if not os.path.exists(commandline.datum):
+        print("%s the datum conversion file cannot be found - are you sure it exists?"%commandline.datum)
+        sys.exit(1)
+
+    #read in the sol file - an arry with each row as a record
+    try:
+        print("Running program ...")
+        main(commandline.config, commandline.input, commandline.output, commandline.datum, hertz=float(commandline.hertz), baseHertz=float(commandline.hertzdef))
+    except Exception as e:
+        print("Failed.\nSomething went wrong!")
+        print(e)

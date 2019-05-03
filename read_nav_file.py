@@ -160,21 +160,21 @@ def readSol(filename):
     record_length=numpy.empty(0, dtype=data_type).itemsize
     header_length_noCheck=numpy.empty(0,
                              dtype=numpy.dtype(sol_header_types()[:-1])).itemsize
-    print(data_type)
+    #print(data_type)
     #Calculate checksum for first record. This is done again later on the whole
     #data set. This is just here so if it is clearly rubbish I don't read the
     #whole file into memory
-    fd=open(filename, 'r', encoding="utf-8",errors="ignore") #, encoding = "ISO-8859-1"
+    fd=open(filename, 'r', encoding="utf-8",errors="ignore")
     header_size=numpy.empty(0, dtype=numpy.dtype(sol_header_types())).itemsize
     header=fd.read(header_size)
     fd.close()
-    #Calculate the checksum - TODO: NOT SURE IF WORKING WITH PYTHON 3
+    # Calculate the checksum - TODO: NOT SURE IF WORKING WITH PYTHON 3
     checksum = 0
-    #Do a cumulative bitwise xor on all elements of the header bytearray
+    # Do a cumulative bitwise xor on all elements of the header bytearray
     for byte in bytearray(header[:-1],encoding="utf8"):
         # ^ means xor
         checksum ^= byte
-    #ADDED THIS TRY TO AVOID ERRORS IN SOME SOL FILES, SEEMS TO WORK OK(kevin mcguigan, AGRG)
+    # ADDED THIS TRY TO AVOID ERRORS IN SOME SOL FILES, SEEMS TO WORK OK(kevin mcguigan, AGRG)
     try:
         if checksum != ord(header[header_size-1]):
             raise IOError("Header checksum does not match")
